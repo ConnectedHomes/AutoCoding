@@ -1,7 +1,7 @@
 //
 //  AutoCoding.m
 //
-//  Version 2.2.1
+//  Version 2.0.3
 //
 //  Created by Nick Lockwood on 19/11/2011.
 //  Copyright (c) 2011 Charcoal Design
@@ -17,7 +17,7 @@
 //
 //  Permission is granted to anyone to use this software for any purpose,
 //  including commercial applications, and to alter it and redistribute it
-//  freely, following restrictions:
+//  freely, subject to the following restrictions:
 //
 //  1. The origin of this software must not be misrepresented; you must not
 //  claim that you wrote the original software. If you use this software
@@ -34,17 +34,85 @@
 #import <objc/runtime.h>
 
 
-#pragma GCC diagnostic ignored "-Wgnu"
+static void AC_swizzleInstanceMethod(Class c, SEL original, SEL replacement)
+{
+    Method a = class_getInstanceMethod(c, original);
+    Method b = class_getInstanceMethod(c, replacement);
+    if (class_addMethod(c, original, method_getImplementation(b), method_getTypeEncoding(b)))
+    {
+        class_replaceMethod(c, replacement, method_getImplementation(a), method_getTypeEncoding(a));
+    }
+    else
+    {
+        method_exchangeImplementations(a, b);
+    }
+}
 
+@interface NSObject (AutoCoding_NSCopying)
 
-static NSString *const AutocodingException = @"AutocodingException";
+- (id)copyWithZone:(NSZone *)zone;
 
+@end
 
 @implementation NSObject (AutoCoding)
 
 + (BOOL)supportsSecureCoding
 {
     return YES;
+}
+
++ (void)load
+{
+    AC_swizzleInstanceMethod(self, @selector(methodSignatureForSelector:), @selector(methodSignatureForSelector_AC:));
+    AC_swizzleInstanceMethod(self, @selector(forwardInvocation:), @selector(forwardInvocation_AC:));
+    AC_swizzleInstanceMethod(self, @selector(respondsToSelector:), @selector(respondsToSelector_AC:));
+}
+
+- (instancetype)copyWithZone_AC:(NSZone *)zone __attribute__((ns_returns_retained))
+{
+    NSObject *copy = [[[self class] allocWithZone:zone] init];
+    for (NSString *key in [self codableProperties])
+    {
+        id object = [self valueForKey:key];
+        if (object) [copy setValue:object forKey:key];
+    }
+    return copy;
+}
+
+- (NSMethodSignature *)methodSignatureForSelector_AC:(SEL)selector
+{
+    @synchronized([self class])
+    {
+        //look up method signature
+        NSMethodSignature *signature = [self methodSignatureForSelector_AC:selector];
+        if (!signature && selector == @selector(copyWithZone:))
+        {
+            return [NSMethodSignature signatureWithObjCTypes:"@@:@"];
+        }
+        return signature;
+    }
+}
+
+- (void)forwardInvocation_AC:(NSInvocation *)invocation
+{
+    if ([invocation selector] == @selector(copyWithZone:))
+    {
+        [invocation setSelector:@selector(copyWithZone_AC:)];
+        [invocation invokeWithTarget:self];
+    }
+    else
+    {
+        [self forwardInvocation_AC:invocation];
+    }
+}
+
+- (BOOL)respondsToSelector_AC:(SEL)selector
+{
+    if (selector == @selector(copyWithZone:))
+    {
+        return YES;
+    }
+    return [self respondsToSelector_AC:selector];
 }
 
 + (instancetype)objectWithContentsOfFile:(NSString *)filePath
@@ -57,13 +125,20 @@ static NSString *const AutocodingException = @"AutocodingException";
     if (data)
     {
         NSPropertyListFormat format;
-        object = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:&format error:NULL];
-       
+        if ([NSPropertyListSerialization respondsToSelector:@selector(propertyListWithData:options:format:error:)])
+        {
+            object = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:&format error:NULL];
+        }
+        else
+        {
+            object = [NSPropertyListSerialization propertyListFromData:data mutabilityOption:NSPropertyListImmutable format:&format errorDescription:NULL];
+        }
+		
 		//success?
 		if (object)
 		{
 			//check if object is an NSCoded unarchive
-			if ([object respondsToSelector:@selector(objectForKey:)] && [(NSDictionary *)object objectForKey:@"$archiver"])
+			if ([object respondsToSelector:@selector(objectForKey:)] && [object objectForKey:@"$archiver"])
 			{
 				object = [NSKeyedUnarchiver unarchiveObjectWithData:data];
 			}
@@ -92,149 +167,159 @@ static NSString *const AutocodingException = @"AutocodingException";
 
 + (NSDictionary *)codableProperties
 {
-    //deprecated
-    SEL deprecatedSelector = NSSelectorFromString(@"codableKeys");
-    if ([self respondsToSelector:deprecatedSelector] || [self instancesRespondToSelector:deprecatedSelector])
+    @synchronized([NSObject class])
     {
-        NSLog(@"AutoCoding Warning: codableKeys method is no longer supported. Use codableProperties instead.");
-    }
-    deprecatedSelector = NSSelectorFromString(@"uncodableKeys");
-    if ([self respondsToSelector:deprecatedSelector] || [self instancesRespondToSelector:deprecatedSelector])
-    {
-        NSLog(@"AutoCoding Warning: uncodableKeys method is no longer supported. Use ivars, or synthesize your properties using non-KVC-compliant names to avoid coding them instead.");
-    }
-    deprecatedSelector = NSSelectorFromString(@"uncodableProperties");
-    NSArray *uncodableProperties = nil;
-    if ([self respondsToSelector:deprecatedSelector] || [self instancesRespondToSelector:deprecatedSelector])
-    {
-        uncodableProperties = [self valueForKey:@"uncodableProperties"];
-        NSLog(@"AutoCoding Warning: uncodableProperties method is no longer supported. Use ivars, or synthesize your properties using non-KVC-compliant names to avoid coding them instead.");
-    }
-    
-    unsigned int propertyCount;
-    __autoreleasing NSMutableDictionary *codableProperties = [NSMutableDictionary dictionary];
-    objc_property_t *properties = class_copyPropertyList(self, &propertyCount);
-    for (unsigned int i = 0; i < propertyCount; i++)
-    {
-        //get property name
-        objc_property_t property = properties[i];
-        const char *propertyName = property_getName(property);
-        __autoreleasing NSString *key = @(propertyName);
-
-        //check if codable
-        if (![uncodableProperties containsObject:key])
+        static NSMutableDictionary *keysByClass = nil;
+        if (keysByClass == nil)
         {
-            //get property type
-            Class propertyClass = nil;
-            char *typeEncoding = property_copyAttributeValue(property, "T");
-            switch (typeEncoding[0])
-            {
-                case '@':
-                {
-                    if (strlen(typeEncoding) >= 3)
-                    {
-                        char *className = strndup(typeEncoding + 2, strlen(typeEncoding) - 3);
-                        __autoreleasing NSString *name = @(className);
-                        NSRange range = [name rangeOfString:@"<"];
-                        if (range.location != NSNotFound)
-                        {
-                            name = [name substringToIndex:range.location];
-                        }
-                        propertyClass = NSClassFromString(name) ?: [NSObject class];
-                        free(className);
-                    }
-                    break;
-                }
-                case 'c':
-                case 'i':
-                case 's':
-                case 'l':
-                case 'q':
-                case 'C':
-                case 'I':
-                case 'S':
-                case 'L':
-                case 'Q':
-                case 'f':
-                case 'd':
-                case 'B':
-                {
-                    propertyClass = [NSNumber class];
-                    break;
-                }
-                case '{':
-                {
-                    propertyClass = [NSValue class];
-                    break;
-                }
-            }
-            free(typeEncoding);
-            
-            if (propertyClass)
-            {
-                //check if there is a backing ivar
-                char *ivar = property_copyAttributeValue(property, "V");
-                if (ivar)
-                {
-                    //check if ivar has KVC-compliant name
-                    __autoreleasing NSString *ivarName = @(ivar);
-                    if ([ivarName isEqualToString:key] || [ivarName isEqualToString:[@"_" stringByAppendingString:key]])
-                    {
-                        //no setter, but setValue:forKey: will still work
-                        codableProperties[key] = propertyClass;
-                    }
-                    free(ivar);
-                }
-                else
-                {
-                    //check if property is dynamic and readwrite
-                    char *dynamic = property_copyAttributeValue(property, "D");
-                    char *readonly = property_copyAttributeValue(property, "R");
-                    if (dynamic && !readonly)
-                    {
-                        //no ivar, but setValue:forKey: will still work
-                        codableProperties[key] = propertyClass;
-                    }
-                    free(dynamic);
-                    free(readonly);
-                }
-            }
+            keysByClass = [[NSMutableDictionary alloc] init];
         }
+        
+        NSString *className = NSStringFromClass(self);
+        NSMutableDictionary *codableProperties = [keysByClass objectForKey:className];
+        if (codableProperties == nil)
+        {
+            //deprecated
+            if ([self respondsToSelector:@selector(codableKeys)] ||
+                [self instancesRespondToSelector:@selector(codableKeys)])
+            {
+                NSLog(@"AutoCoding Warning: codableKeys method is no longer supported. Use codableProperties instead.");
+            }
+            if ([self respondsToSelector:@selector(uncodableKeys)] ||
+                [self instancesRespondToSelector:@selector(uncodableKeys)])
+            {
+                NSLog(@"AutoCoding Warning: uncodableKeys method is no longer supported. Use uncodableProperties instead.");
+            }
+            
+            codableProperties = [NSMutableDictionary dictionary];
+            unsigned int propertyCount;
+            objc_property_t *properties = class_copyPropertyList(self, &propertyCount);
+            for (unsigned int i = 0; i < propertyCount; i++)
+            {
+                //get property name
+                objc_property_t property = properties[i];
+                const char *propertyName = property_getName(property);
+                NSString *key = [NSString stringWithCString:propertyName encoding:NSUTF8StringEncoding];
+                
+                //check if codable
+                if (![[self uncodableProperties] containsObject:key])
+                {
+                    //get property type
+                    Class class = nil;
+                    char *typeEncoding = property_copyAttributeValue(property, "T");
+                    switch (typeEncoding[0])
+                    {
+                        case '@':
+                        {
+                            if (strlen(typeEncoding) >= 3)
+                            {
+                                char *className = strndup(typeEncoding + 2, strlen(typeEncoding) - 3);
+                                NSString *name = [NSString stringWithUTF8String:className];
+                                NSRange range = [name rangeOfString:@"<"];
+                                if (range.location != NSNotFound)
+                                {
+                                    name = [name substringToIndex:range.location];
+                                }
+                                class = NSClassFromString(name) ?: [NSObject class];
+                                free(className);
+                            }
+                            break;
+                        }
+                        case 'c':
+                        case 'i':
+                        case 's':
+                        case 'l':
+                        case 'q':
+                        case 'C':
+                        case 'I':
+                        case 'S':
+                        case 'f':
+                        case 'd':
+                        case 'B':
+                        {
+                            class = [NSNumber class];
+                            break;
+                        }
+                        case '{':
+                        {
+                            class = [NSValue class];
+                            break;
+                        }
+                    }
+                    free(typeEncoding);
+                    
+                    if (class)
+                    {
+                        //see if there is a backing ivar
+                        char *ivar = property_copyAttributeValue(property, "V");
+                        if (ivar)
+                        {
+                            char *readonly = property_copyAttributeValue(property, "R");
+                            if (readonly)
+                            {
+                                //check if ivar has KVC-compliant name
+                                NSString *ivarName = [NSString stringWithFormat:@"%s", ivar];
+                                if ([ivarName isEqualToString:key] ||
+                                    [ivarName isEqualToString:[@"_" stringByAppendingString:key]])
+                                {
+                                    //no setter, but setValue:forKey: will still work
+                                    codableProperties[key] = class;
+                                }
+                                free(readonly);
+                            }
+                            else
+                            {
+                                //there is a setter method so setValue:forKey: will work
+                                codableProperties[key] = class;
+                            }
+                            free(ivar);
+                        }
+                    }
+                }
+            }
+            free(properties);
+            [keysByClass setObject:[NSDictionary dictionaryWithDictionary:codableProperties] forKey:className];
+        }
+        return codableProperties;
     }
-    
-    free(properties);
-    return codableProperties;
+}
+
++ (NSArray *)uncodableProperties
+{
+    return nil;
 }
 
 - (NSDictionary *)codableProperties
 {
-    __autoreleasing NSDictionary *codableProperties = objc_getAssociatedObject([self class], _cmd);
-    if (!codableProperties)
+    @synchronized([NSObject class])
     {
-        codableProperties = [NSMutableDictionary dictionary];
-        Class subclass = [self class];
-        while (subclass != [NSObject class])
+        static NSMutableDictionary *propertiesByClass = nil;
+        if (propertiesByClass == nil)
         {
-            [(NSMutableDictionary *)codableProperties addEntriesFromDictionary:[subclass codableProperties]];
-            subclass = [subclass superclass];
+            propertiesByClass = [[NSMutableDictionary alloc] init];
         }
-        codableProperties = [NSDictionary dictionaryWithDictionary:codableProperties];
         
-        //make the association atomically so that we don't need to bother with an @synchronize
-        objc_setAssociatedObject([self class], _cmd, codableProperties, OBJC_ASSOCIATION_RETAIN);
+        NSString *className = NSStringFromClass([self class]);
+        NSDictionary *codableProperties = propertiesByClass[className];
+        if (codableProperties == nil)
+        {
+            NSMutableDictionary *properties = [NSMutableDictionary dictionary];
+            Class class = [self class];
+            while (class != [NSObject class])
+            {
+                [properties addEntriesFromDictionary:[class codableProperties]];
+                class = [class superclass];
+            }
+            codableProperties = [properties copy];
+            [propertiesByClass setObject:codableProperties forKey:className];
+        }
+        return codableProperties;
     }
-    return codableProperties;
 }
 
 - (NSDictionary *)dictionaryRepresentation
 {
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    for (__unsafe_unretained NSString *key in [self codableProperties])
-    {
-        id value = [self valueForKey:key];
-        if (value) dict[key] = value;
-    }
-    return dict;
+    return [self dictionaryWithValuesForKeys:[[self codableProperties] allKeys]];
 }
 
 - (void)setWithCoder:(NSCoder *)aDecoder
@@ -245,10 +330,10 @@ static NSString *const AutocodingException = @"AutocodingException";
     for (NSString *key in properties)
     {
         id object = nil;
-        Class propertyClass = properties[key];
-        if (secureAvailable)
+        Class class = properties[key];
+        if (secureAvailable && secureSupported)
         {
-            object = [aDecoder decodeObjectOfClass:propertyClass forKey:key];
+            object = [aDecoder decodeObjectOfClass:class forKey:key];
         }
         else
         {
@@ -256,9 +341,10 @@ static NSString *const AutocodingException = @"AutocodingException";
         }
         if (object)
         {
-            if (secureSupported && ![object isKindOfClass:propertyClass])
+            // Check we are unarchiving the correct class - unless we are unarchiving an NSNull
+            if (secureSupported && ![object isKindOfClass:class] && ![object isKindOfClass:[NSNull class]])
             {
-                [NSException raise:AutocodingException format:@"Expected '%@' to be a %@, but was actually a %@", key, propertyClass, [object class]];
+                [NSException raise:@"AutocodingException" format:@"Expected '%@' to be a %@, but was actually a %@", key, class, [object class]];
             }
             [self setValue:object forKey:key];
         }
